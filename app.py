@@ -1,7 +1,11 @@
 import os
 import sqlite3
+import json
+import re
+import google.generativeai as genai
 from flask import Flask, render_template, request, jsonify
 from dotenv import load_dotenv
+from tools import get_available_tools, get_tools_description
 
 load_dotenv()
 
@@ -9,6 +13,157 @@ app = Flask(__name__)
 
 # Use PORT environment variable for Render.com compatibility
 PORT = int(os.environ.get('PORT', 5000))
+
+# Initialize Gemini AI
+api_key = os.environ.get('GEMINI_API_KEY')
+genai.configure(api_key=api_key)
+model = genai.GenerativeModel('gemini-pro')
+
+# Load available tools
+available_tools = {tool['name']: tool['function'] for tool in get_available_tools()}
+
+def process_ai_request(user_message):
+    """Process user request using AI and execute appropriate task management tools."""
+    
+    # Create a system prompt with available tools
+    system_prompt = f"""You are a helpful AI assistant for task management. You have access to these tools:
+
+{get_tools_description()}
+
+When users ask you to perform actions, analyze their request and determine which tool to use. 
+
+For common patterns:
+- "show/list/get tasks" → use get_tasks
+- "add/create task" → use add_task  
+- "delete/remove task" → use delete_task
+- "move/update task status" → use update_task_status
+- "stats/statistics/summary" → use get_task_stats
+
+User request: {user_message}"""
+
+    try:
+        # Generate response from Gemini to understand intent
+        response = model.generate_content(system_prompt)
+        ai_response = response.text
+        
+        # Enhanced pattern matching to detect and execute tool calls
+        user_lower = user_message.lower()
+        
+        # Stats/Summary requests
+        if any(word in user_lower for word in ["stats", "statistics", "summary", "progress", "overview"]):
+            return available_tools['get_task_stats']()
+        
+        # Show/List tasks
+        elif any(word in user_lower for word in ["show", "list", "get", "display"]) and "task" in user_lower:
+            if "todo" in user_lower:
+                return available_tools['get_tasks']("todo")
+            elif any(word in user_lower for word in ["progress", "doing", "working"]):
+                return available_tools['get_tasks']("in_progress")
+            elif any(word in user_lower for word in ["done", "completed", "finished"]):
+                return available_tools['get_tasks']("done")
+            else:
+                return available_tools['get_tasks']()
+                
+        # Add/Create task
+        elif any(word in user_lower for word in ["add", "create", "new"]) and "task" in user_lower:
+            # Enhanced parsing for task creation
+            title, assignee, priority = parse_task_creation(user_message)
+            return available_tools['add_task'](title, assignee=assignee, priority=priority)
+            
+        # Delete/Remove task
+        elif any(word in user_lower for word in ["delete", "remove"]) and "task" in user_lower:
+            task_id = extract_task_id(user_message)
+            if task_id:
+                return available_tools['delete_task'](task_id)
+            return "Please specify a task ID to delete (e.g., 'delete task 5')"
+            
+        # Move/Update task status
+        elif any(word in user_lower for word in ["move", "update", "change"]) and "task" in user_lower:
+            task_id = extract_task_id(user_message)
+            status = extract_status(user_message)
+            if task_id and status:
+                return available_tools['update_task_status'](task_id, status)
+            return "Please specify task ID and status (e.g., 'move task 1 to done')"
+        
+        # Default: return AI response for general questions
+        else:
+            return ai_response
+            
+    except Exception as e:
+        return f"Sorry, I encountered an error: {str(e)}"
+
+def parse_task_creation(message):
+    """Parse task creation message to extract title, assignee, and priority."""
+    words = message.split()
+    title = "New Task"
+    assignee = ""
+    priority = 5
+    
+    # Look for "for [name]" pattern
+    for i, word in enumerate(words):
+        if word.lower() == "for" and i + 1 < len(words):
+            assignee = words[i + 1].strip(',.')
+            break
+    
+    # Look for priority patterns like "priority 8", "P8", "high priority"
+    for i, word in enumerate(words):
+        if word.lower() in ["priority", "p"] and i + 1 < len(words):
+            try:
+                priority = int(words[i + 1])
+                break
+            except ValueError:
+                pass
+        elif word.lower() == "high":
+            priority = 8
+        elif word.lower() == "low":
+            priority = 3
+    
+    # Extract title (everything after trigger words until "for" or "priority")
+    start_idx = 0
+    for i, word in enumerate(words):
+        if word.lower() in ["add", "create", "new", "task"]:
+            start_idx = i + 1
+            break
+    
+    end_idx = len(words)
+    for i, word in enumerate(words[start_idx:], start_idx):
+        if word.lower() in ["for", "priority", "p"]:
+            end_idx = i
+            break
+    
+    if start_idx < end_idx:
+        title = " ".join(words[start_idx:end_idx]).strip(',.')
+    
+    return title, assignee, priority
+
+def extract_task_id(message):
+    """Extract task ID from message."""
+    # Look for patterns like "task 5", "#5", "ID 5"
+    patterns = [
+        r'task\s+(\d+)',
+        r'#(\d+)',
+        r'id\s+(\d+)',
+        r'\b(\d+)\b'  # Any standalone number
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, message.lower())
+        if match:
+            return int(match.group(1))
+    return None
+
+def extract_status(message):
+    """Extract status from message."""
+    message_lower = message.lower()
+    
+    if any(word in message_lower for word in ["todo", "to do", "backlog"]):
+        return "todo"
+    elif any(word in message_lower for word in ["progress", "doing", "working", "started"]):
+        return "in_progress"
+    elif any(word in message_lower for word in ["done", "completed", "finished", "complete"]):
+        return "done"
+    
+    return None
 
 def init_db():
     """Initialize SQLite database with enhanced task structure and sprints."""
@@ -226,6 +381,30 @@ def delete_task(task_id):
     conn.close()
     
     return jsonify({'success': True, 'deleted_task_id': task_id})
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Chat endpoint for AI agent to manage tasks."""
+    try:
+        data = request.get_json()
+        if not data or 'message' not in data:
+            return jsonify({'error': 'Message is required'}), 400
+        
+        user_message = data['message']
+        
+        # Use the AI function to process the message
+        response = process_ai_request(user_message)
+        
+        return jsonify({
+            'response': response,
+            'success': True
+        })
+    
+    except Exception as e:
+        return jsonify({
+            'error': f'Chat error: {str(e)}',
+            'success': False
+        }), 500
 
 if __name__ == '__main__':
     init_db()
